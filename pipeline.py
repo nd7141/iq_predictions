@@ -1,3 +1,13 @@
+import networkx as nx
+import numpy as np
+import os
+import pandas as pd
+from scipy.stats import describe
+from collections import defaultdict as ddict, Counter
+import matplotlib.pyplot as plt
+import random
+import pickle
+
 from torch_geometric.utils.convert import from_networkx
 from torch_geometric.datasets import TUDataset
 from torch_geometric.data import batch, Data, InMemoryDataset, DataLoader
@@ -11,15 +21,19 @@ from torch_geometric.data import DataLoader
 from torch_geometric.nn import GINConv, global_add_pool
 from torch.nn import MSELoss, L1Loss
 
-import networkx as nx
-import numpy as np
-import os
-import pandas as pd
-from scipy.stats import describe
-from collections import defaultdict as ddict
-import matplotlib.pyplot as plt
-import random
 import pickle
+from sklearn.model_selection import KFold
+
+from sklearn.svm import SVR
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from sklearn.neighbors import KNeighborsRegressor as KNR, RadiusNeighborsRegressor as RNR
+from sklearn.gaussian_process import GaussianProcessRegressor as GPR
+from sklearn.kernel_ridge import KernelRidge as KR
+from sklearn.linear_model import SGDRegressor as SGDR
+from sklearn.tree import DecisionTreeRegressor as DTR
+from sklearn.neural_network import MLPRegressor as MLP
+
+from scipy.stats import pearsonr
 
 class Pipeline():
     def __init__(self, model, human2data):
@@ -141,12 +155,92 @@ class Pipeline():
         return mse_loss, mae_loss
 
     def train_and_evaluate(self, n_epochs, train_loader, test_loader):
-        print("epoch train_mse train_mae, mse mae")
+        # print("epoch train_mse train_mae, mse mae")
         test_losses = []
         for epoch in range(n_epochs):
             train_loss = self.trainx(train_loader)
             train_mse, train_mae = self.testx(train_loader)
             mse, mae = self.testx(test_loader)
             test_losses.append((epoch, mse, mae))
-            print(f"{epoch} {train_loss:.2f} {train_mse:.2f} {train_mae:.2f}, {mse:.2f} {mae:.2f}")
+            # print(f"{epoch} {train_loss:.2f} {train_mse:.2f} {train_mae:.2f}, {mse:.2f} {mae:.2f}")
         return test_losses
+
+
+class RegressionPipeline():
+    def __init__(self, human2data, human2embedding):
+        self.human2data = human2data
+        self.human2embedding = human2embedding
+
+        self.emb_dim = len(self.human2embedding[1112])
+
+        self.models = [SVR(kernel='rbf', tol=10 ** -6),
+                       KNR(5, weights='distance'),
+                       GPR(normalize_y=True),
+                       KR(),
+                       SGDR(loss='huber', penalty='l1'),
+                       DTR(criterion='mae'),
+                       #           MLP(10, learning_rate_init=0.9, max_iter=10000)
+                       ]
+
+        self.get_human2score()
+
+    def get_human2score(self):
+        human2score = dict()
+        for human in self.human2data:
+            score = self.human2data[human][0][1]
+            human2score[human] = score
+        self.human2score = human2score
+
+    def kfold_split(self, nsplits, batch_size=128):
+        human2data = self.human2data
+        humans = np.array(list(human2data.keys()))
+        kfold = KFold(nsplits, shuffle=True, random_state=42)
+        folds = []
+        for train_ix, test_ix in kfold.split(humans):
+            train_humans = humans[train_ix]
+            test_humans = humans[test_ix]
+            folds.append((train_humans, test_humans))
+        return folds
+
+    def prepare_classifier_data(self, humans):
+        X = np.zeros((len(humans), self.emb_dim))
+        y = np.zeros((len(humans),))
+        for i, human in enumerate(humans):
+            X[i] = self.human2embedding[human]
+            y[i] = self.human2score[human]
+        return X, y
+
+    def run_full_pipeline(self):
+        folds = self.kfold_split(10)
+        results = dict()
+        for model in self.models:
+            maes = []
+            mses = []
+            for train_humans, test_humans in folds:
+                X_train, y_train = self.prepare_classifier_data(train_humans)
+                X_test, y_test = self.prepare_classifier_data(test_humans)
+
+                model.fit(X_train, y_train)
+                predictions = model.predict(X_test)
+                mses.append(np.sqrt(mean_squared_error(predictions, y_test)))
+                maes.append(mean_absolute_error(predictions, y_test))
+            #         print(len(test_humans), mean_squared_error(predictions, y_test), mean_absolute_error(predictions, y_test))
+            print("{}".format(model.__class__.__name__), "RMSE: {:.2f}".format(np.mean(mses)),
+                  "MAE: {:.2f}".format(np.mean(maes)))
+            results[model.__class__.__name__] = (np.mean(mses), np.mean(maes))
+        return results
+
+    def run_avg_train_model(self):
+        folds = self.kfold_split(10)
+        maes = []
+        mses = []
+        for train_humans, test_humans in folds:
+            counter = Counter([self.human2score[human] for human in train_humans])
+            most_common_value = counter.most_common(1)[0][0]
+            predictions = np.array([most_common_value] * len(test_humans))
+            _, y_test = self.prepare_classifier_data(test_humans)
+
+            mses.append(np.sqrt(mean_squared_error(predictions, y_test)))
+            maes.append(mean_absolute_error(predictions, y_test))
+        #         print(len(test_humans), mean_squared_error(predictions, y_test), mean_absolute_error(predictions, y_test))
+        print("Avg train model", "RMSE: {:.2f}".format(np.mean(mses)), "MAE: {:.2f}".format(np.mean(maes)))

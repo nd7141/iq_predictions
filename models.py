@@ -45,6 +45,7 @@ class GIN(torch.nn.Module):
         return x
 
 
+
 class MotifEmbedding():
     def __init__(self, human2data):
         self.human2data = human2data
@@ -101,12 +102,12 @@ class MotifEmbedding():
             self.human2embedding[human] = self.compute_human_embedding(graphs, n_samples)
             # break
 
-    def save_embeddings(self):
-        with open("human2embedding.pkl", 'wb') as f:
+    def save_embeddings(self, fname="human2embedding.pkl"):
+        with open(fname, 'wb') as f:
             pickle.dump(self.human2embedding, f)
 
-    def load_embeddings(self):
-        with open("human2embedding.pkl", 'rb') as f:
+    def load_embeddings(self, fname="human2embedding.pkl"):
+        with open(fname, 'rb') as f:
             self.human2embedding = pickle.load(f)
 
     def kfold_split(self, nsplits, batch_size=128):
@@ -117,3 +118,74 @@ class MotifEmbedding():
             train_humans = humans[train_ix]
             test_humans = humans[test_ix]
             return train_humans, test_humans
+
+
+class BaselineEmbedding():
+    def __init__(self, folder, target_file, human2data=None):
+        self.folder = folder
+        self.target_file = target_file
+        self.human2data = human2data
+
+    def get_labels(self):
+        target = pd.read_csv(self.target_file)
+        target = target[~target.pcrvtot.isna()]
+        return dict(zip(target.twinid, target.pcrvtot))
+
+    def get_matrices(self, sep=','):
+        human2iq = self.get_labels()
+        human2matrices = ddict(list)
+        for p in os.listdir(self.folder):
+            human = int(p.split('_')[0])
+            ritm = p.split('_')[-1]
+            if human in human2iq:
+                human2matrices[human].append((ritm, np.loadtxt(self.folder + '/' + p, delimiter=sep)))
+        self.human2matrices = human2matrices
+        self.ritms = dict(self.human2matrices[1112]).keys()
+        self.ritm2ix = dict(zip(self.ritms, range(len(self.ritms))))
+        self.human2score = human2iq
+
+    def get_human2embedding(self):
+        human2embedding = dict()
+        for human in self.human2matrices:
+            ritm2matrix = dict(self.human2matrices[human])
+            emb = np.zeros((len(self.ritm2ix, )))
+            for ritm, matrix in ritm2matrix.items():
+                emb[self.ritm2ix[ritm]] = matrix.sum()
+            human2embedding[human] = emb
+        self.human2embedding = human2embedding
+
+    def get_flatten_embedding(self):
+        human2embedding = dict()
+        ri, ci = np.tril_indices(64, k=-1)
+        for human, ritm_matrices in self.human2matrices.items():
+            emb = np.zeros((2016,))
+            zero_matrix = np.zeros((64, 64))
+            for ritm, matrix in ritm_matrices:
+                if matrix.shape[0] < 64:
+                    zero_matrix[:(matrix.shape[0]), :(matrix.shape[0])] = matrix
+                    matrix = zero_matrix
+                matrix = matrix[:64, :64]
+                emb += matrix[ri, ci]
+            human2embedding[human] = emb
+        self.human2flatten_embedding = human2embedding
+
+    def make_df_from_embeddings_and_labels(self, human2embeddings):
+        array = []
+        for human, emb in human2embeddings.items():
+            array.append(list(emb) + [be.human2score[human]])
+        df = pd.DataFrame(array)
+        return df
+
+    def make_numpy_data(self, method='flatten'):
+        if method == 'flatten':
+            embeddings = self.human2flatten_embedding
+        else:
+            embeddings = self.human2embedding
+        a = len(embeddings)
+        b = len(embeddings[1112])
+        X = np.zeros((a, b))
+        y = np.zeros((a))
+        for i, human in enumerate(embeddings):
+            X[i, :] = embeddings[human]
+            y[i] = self.human2score[human]
+        return X, y
